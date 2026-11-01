@@ -160,7 +160,8 @@ def fetch(src, dst, size, cov, deadline=None, stats=None, nconn=None, part=None)
 
 
 ORDEM = [('R2', 16, 64 << 20), ('HF', 16, 64 << 20)]  # (origem, conexoes, parte); bench reordena
-BENCH_CFG = [('R2', 16, 64 << 20), ('R2', 32, 64 << 20), ('R2', 64, 32 << 20), ('HF', 16, 64 << 20)]
+# HF primeiro: em 01/11 o R2 completou o arquivo de 20 GB durante o bench e o HF nunca foi medido
+BENCH_CFG = [('HF', 16, 64 << 20), ('R2', 16, 64 << 20), ('R2', 32, 64 << 20), ('R2', 64, 32 << 20)]
 
 
 def get_file(k, dst, size, bench=False):
