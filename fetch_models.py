@@ -17,7 +17,7 @@ HF_MAP = json.loads(E.get('HF_FILE_MAP', '{}') or '{}')  # {arquivo: 'repo:camin
 STALL_S = int(E.get('STALL_S', '180'))
 BENCH_S = float(E.get('BENCH_S', '35'))
 PART = 64 << 20; SUB = 8 << 20; TAIL = int(E.get('DL_TAIL_MB', '64')) << 20; NCONN = int(E.get('DL_CONN', '16'))
-SLOW_S = float(E.get('DL_SLOW_S', '10')); SLOW_REL = 0.30; SLOW_FLOOR = 1e6
+MAXERR = int(E.get('DL_MAXERR', '200')); SLOW_S = float(E.get('DL_SLOW_S', '10')); SLOW_REL = 0.30; SLOW_FLOOR = 1e6
 SKIP = [s.strip() for s in E.get('MODELS_SKIP', '').split(',') if s.strip()]
 s3 = boto3.client('s3', endpoint_url=E['R2_EP'], aws_access_key_id=E['R2_ACCESS_KEY_ID'],
                   aws_secret_access_key=E['R2_SECRET_ACCESS_KEY'], region_name='auto',
@@ -42,7 +42,7 @@ def gaps(cov, size):
 def covered(cov, size): return size - sum(e - o + 1 for o, e in gaps(cov, size))
 
 
-R2REQ = [0]
+R2REQ = [0]; ULT = ['?']
 
 
 class R2:
@@ -95,7 +95,7 @@ def fetch(src, dst, size, cov, deadline=None, stats=None, nconn=None, part=None)
     else:
       if g0 < cut: q += split(g0, cut - 1, part); g0 = cut
       q += [r for r in split(g0, g1, SUB) for _ in (0, 1)]  # cauda duplicada (hedged)
-  lock = threading.Lock(); cancel = threading.Event(); prog = [time.time()]; ativos = {}; feitos = set()
+  lock = threading.Lock(); cancel = threading.Event(); prog = [time.time()]; ativos = {}; feitos = set(); nerr = [0]
   st = stats if stats is not None else {}; st.setdefault('slow', 0); st.setdefault('bytes', 0)
   def worker():
     fd = os.open(dst, os.O_WRONLY)
@@ -139,6 +139,9 @@ def fetch(src, dst, size, cov, deadline=None, stats=None, nconn=None, part=None)
           log('WARN faixa', src.name, o, type(e).__name__, str(e)[:120])
           with lock:
             if pos > o: cov.append((o, pos - 1))
+            nerr[0] += 1
+            if pos <= end and nerr[0] <= MAXERR: q.append((pos, end))  # repede o resto da faixa (mesma origem)
+          time.sleep(1)
         finally:
           with lock: ativos.pop(me, None)
     finally: os.close(fd)
@@ -161,6 +164,9 @@ def fetch(src, dst, size, cov, deadline=None, stats=None, nconn=None, part=None)
 
 ORDEM = [('R2', 16, 64 << 20), ('HF', 16, 64 << 20)]  # (origem, conexoes, parte); bench reordena
 # HF primeiro: em 01/11 o R2 completou o arquivo de 20 GB durante o bench e o HF nunca foi medido
+FONTE = E.get('MODELS_SOURCE', 'bench').lower()  # bench | hf | r2 (a outra so como reserva apos 3 min parado/erro)
+if FONTE == 'hf': ORDEM = [('HF', 16, 64 << 20), ('R2', 16, 64 << 20)]
+elif FONTE == 'r2': ORDEM = [('R2', 16, 64 << 20), ('HF', 16, 64 << 20)]
 BENCH_CFG = [('HF', 16, 64 << 20), ('R2', 16, 64 << 20), ('R2', 32, 64 << 20), ('R2', 64, 32 << 20)]
 
 
@@ -169,7 +175,7 @@ def get_file(k, dst, size, bench=False):
   with open(dst, 'ab') as f: f.truncate(size)
   cov = []; mk = {'R2': R2, 'HF': HF}; t0 = time.time(); stats = {}
   temhf = bool(HF_REPO or k in HF_MAP)
-  if bench:
+  if bench and FONTE == 'bench':
     res = {}
     for cfg in BENCH_CFG:
       nm, nc, pt = cfg
@@ -188,6 +194,7 @@ def get_file(k, dst, size, bench=False):
   ordem = ORDEM if temhf else [c for c in ORDEM if c[0] == 'R2'] or [('R2', 16, 64 << 20)]
   while gaps(cov, size) and tent < 4:
     nm, nc, pt = ordem[tent % len(ordem)]; tent += 1
+    ULT[0] = nm
     try: m = fetch(mk[nm](k), dst, size, cov, stats=stats, nconn=nc, part=pt)
     except Exception as e: m = f'erro {type(e).__name__}: {str(e)[:150]}'
     if m != 'ok': log('RESUME', k, f'origem={nm}', m, f'{covered(cov, size) >> 20}MB')
@@ -210,7 +217,8 @@ def check_hash(path, want, k):
 def main():
   try: man = json.loads(s3.get_object(Bucket=B, Key=P + 'manifest.json')['Body'].read())
   except Exception as e: log('ABORT manifest', type(e).__name__, e); sys.exit(4)
-  ths, failed, first = [], [], True
+  ths, failed, first = [], [], True; T0 = time.time()
+  log('PHASE fonte', FONTE, 'ordem=' + ','.join(f'{o}/{c}' for o, c, _ in ORDEM))
   for k, v in sorted(man.items(), key=lambda kv: -kv[1]['size']):
     if any(s in k for s in SKIP): log('skip', k); continue
     dst = M + k; os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -218,13 +226,15 @@ def main():
       dt, slow = get_file(k, dst, v['size'], bench=first); first = False
     except Exception as e:
       log('WARN', k, type(e).__name__, str(e)[:300]); failed.append(k); continue
-    log('PHASE dl_model', k, f'origem={ORDEM[0][0]}/{ORDEM[0][1]}', f'{dt:.0f}s', f'{v["size"] / max(dt, 1e-3) / 1e6:.0f}MB/s', f'slow_repedidos={slow}', 'size_ok')
+    log('PHASE dl_model', k, f'origem={ULT[0]}', f'{dt:.0f}s', f'{v["size"] / max(dt, 1e-3) / 1e6:.0f}MB/s', f'slow_repedidos={slow}', 'size_ok')
     th = threading.Thread(target=check_hash, args=(dst, v['sha256'], k)); th.start(); ths.append(th)
   for th in ths: th.join()
   if failed or hash_fail:
     log('PHASE r2_requests', f'total={R2REQ[0]}')
     log('PHASE models_verified FAIL', 'dl=' + ','.join(failed), 'hash=' + ','.join(hash_fail)); sys.exit(4)
   log('PHASE r2_requests', f'total={R2REQ[0]}')
+  tot = sum(v['size'] for k, v in man.items() if not any(x in k for x in SKIP))
+  log('PHASE models_total', f'{time.time() - T0:.0f}s', f'{tot / max(time.time() - T0, 1e-3) / 1e6:.0f}MB/s')
   log('PHASE models_verified ok')
 
 
