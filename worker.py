@@ -8,7 +8,8 @@ B = E['R2_BUCKET']
 Q = E['QUEUE_PREFIX'].rstrip('/') + '/'
 GPU = E.get('GPU', '')
 # nomes de modelos/no vem do ambiente (obrigatorios, sem padrao)
-DEF = dict(width=480, height=864, steps=8, unet=E['M_UNET'])
+DEF = dict(width=480, height=864, steps=8, unet=E['M_UNET'], lora=E['M_LORA'], sampler='res_multistep', sigmas=None)
+# job pode trocar lora/sampler/sigmas (ex Pika H3 Flex: lora pika, sampler lcm, sigmas ManualSigmas); sem campos = receita H3 padrao
 M_TE, M_TE_TYPE, M_VAE_V, M_VAE_A, M_LORA, N_GEN = (E[k] for k in ('M_TE', 'M_TE_TYPE', 'M_VAE_V', 'M_VAE_A', 'M_LORA', 'N_GEN'))
 s3 = boto3.client('s3', endpoint_url=E['R2_EP'], aws_access_key_id=E['R2_ACCESS_KEY_ID'],
                   aws_secret_access_key=E['R2_SECRET_ACCESS_KEY'], region_name='auto')
@@ -40,15 +41,16 @@ def workflow(j, imgs, p):
        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": M_TE, "type": M_TE_TYPE, "device": "default"}},
        "3": {"class_type": "VAELoader", "inputs": {"vae_name": M_VAE_V}},
        "4": {"class_type": "VAELoader", "inputs": {"vae_name": M_VAE_A}},
-       "L": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": M_LORA, "strength_model": 1.0}}}
+       "L": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": p['lora'], "strength_model": 1.0}}}
   ri = {}
   for i, n in enumerate(imgs):
     w[f"i{i}"] = {"class_type": "LoadImage", "inputs": {"image": n}}; ri[f"ref_images.ref_image_{i}"] = [f"i{i}", 0]
   w["5"] = {"class_type": N_GEN, "inputs": {"clip": ["2", 0], "vae": ["3", 0], "audio_vae": ["4", 0], "prompt": j['prompt'],
             "width": p['width'], "height": p['height'], "length": j['length'], "ref_image_size": "match", **ri}}
   w.update({"6": {"class_type": "RandomNoise", "inputs": {"noise_seed": j['seed']}},
-            "7": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
-            "8": {"class_type": "BasicScheduler", "inputs": {"model": ["L", 0], "scheduler": "simple", "steps": p['steps'], "denoise": 1.0}},
+            "7": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": p['sampler']}},
+            "8": ({"class_type": "ManualSigmas", "inputs": {"sigmas": p['sigmas']}} if p['sigmas'] else
+                  {"class_type": "BasicScheduler", "inputs": {"model": ["L", 0], "scheduler": "simple", "steps": p['steps'], "denoise": 1.0}}),
             "9": {"class_type": "BasicGuider", "inputs": {"model": ["L", 0], "conditioning": ["5", 0]}},
             "10": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["6", 0], "guider": ["9", 0], "sampler": ["7", 0], "sigmas": ["8", 0], "latent_image": ["5", 1]}},
             "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
