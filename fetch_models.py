@@ -57,8 +57,8 @@ def check_hash(path, want, k):
 
 PART = 64 << 20
 RESUMES = int(E.get('DL_RESUMES', '2'))
-SUB = 8 << 20; TAIL = int(E.get('DL_TAIL_MB', '256')) << 20; NCONN = 16
-SLOW_BPS = float(E.get('DL_SLOW_MBPS', '5')) * 1e6; SLOW_S = float(E.get('DL_SLOW_S', '20'))
+SUB = 8 << 20; TAIL = int(E.get('DL_TAIL_MB', '64')) << 20; NCONN = 16
+SLOW_BPS = float(E.get('DL_SLOW_MBPS', '5')) * 1e6; SLOW_S = float(E.get('DL_SLOW_S', '10'))
 from botocore.config import Config as BCfg
 s3dl = boto3.client('s3', endpoint_url=E['R2_EP'], aws_access_key_id=E['R2_ACCESS_KEY_ID'],
                     aws_secret_access_key=E['R2_SECRET_ACCESS_KEY'], region_name='auto',
@@ -69,72 +69,104 @@ def split(o, end, sz):
   return [(x, min(x + sz, end + 1) - 1) for x in range(o, end + 1, sz)]
 
 
+def gaps(cov, size):
+  out, p = [], 0
+  for o, e in sorted(cov):
+    if o > p: out.append((p, o - 1))
+    p = max(p, e + 1)
+  if p < size: out.append((p, size - 1))
+  return out
+
+
 def from_r2(k, dst):
-  # ranged GET paralelo; cauda (ultimos TAIL bytes) em partes de SUB; parte lenta (<SLOW_BPS por >SLOW_S) e redividida em SUB;
-  # parado STALL_S => cancela e retoma so os ranges faltantes (ate RESUMES vezes)
+  # ranged GET paralelo (16 conexoes). Cauda (ultimos TAIL bytes) em partes de SUB baixadas em duplicado (hedged, vale a 1a).
+  # Range < SLOW_BPS por > SLOW_S: cancela e repede o restante da faixa em outra conexao (redividido em SUB).
+  # Parado STALL_S: cancela tudo e retoma so as lacunas (ate RESUMES vezes). sha256 checado depois.
   size = s3dl.head_object(Bucket=B, Key=P + k)['ContentLength']
   with open(dst, 'ab') as f: f.truncate(size)
   cut = max(0, size - TAIL) // PART * PART
-  todo = split(0, cut - 1, PART) + split(cut, size - 1, SUB) if cut else split(0, size - 1, SUB)
-  todo = [r for r in todo if r[0] <= r[1]]
-  done_b = [0]; lock = threading.Lock(); got, last = [0], [time.time()]; nsplit = [0]
+  body = split(0, cut - 1, PART) if cut else []
+  tail = split(cut, size - 1, SUB)
+  cov = []; lock = threading.Lock(); got, last = [0], [time.time()]; st = {'slow': 0, 'hedge_win': 0}
+  t_tail = [None, None]
   for tent in range(RESUMES + 1):
-    if not todo: break
-    if tent: log('RESUME', k, f'tentativa={tent}', f'ranges_faltando={len(todo)}', f'{done_b[0] >> 20}MB')
-    cancel = threading.Event(); prog = [time.time()]; q = todo; todo = []; ativos = [0]
+    if tent == 0: q = body + [r for r in tail for _ in (0, 1)]
+    else:
+      q = [r for g in gaps(cov, size) for r in split(g[0], g[1], SUB)]
+      if not q: break
+      log('RESUME', k, f'tentativa={tent}', f'ranges={len(q)}', f'{sum(e - o + 1 for o, e in cov) >> 20}MB')
+    cancel = threading.Event(); prog = [time.time()]; ativos = [0]; feitos = set()
     def worker():
       fd = os.open(dst, os.O_WRONLY)
       try:
         while not cancel.is_set():
           with lock:
-            if not q:
-              if ativos[0] == 0: return
+            r = None
+            while q:
+              r = q.pop(0)
+              if r not in feitos: break
               r = None
-            else: r = q.pop(0); ativos[0] += 1
-          if r is None: time.sleep(0.5); continue
-          o, end = r; pos = o; t0 = time.time(); ok = False
+            if r is None:
+              if ativos[0] == 0: return
+            else:
+              ativos[0] += 1
+              if r[0] >= cut and t_tail[0] is None: t_tail[0] = time.time()
+          if r is None: time.sleep(0.3); continue
+          o, end = r; pos = o; t0 = time.time()
           try:
-            body = s3dl.get_object(Bucket=B, Key=P + k, Range=f'bytes={o}-{end}')['Body']
-            for c in body.iter_chunks(1 << 20):
-              if cancel.is_set(): break
+            b = s3dl.get_object(Bucket=B, Key=P + k, Range=f'bytes={o}-{end}')['Body']
+            for c in b.iter_chunks(1 << 20):
+              if cancel.is_set() or r in feitos: break
               os.pwrite(fd, c, pos); pos += len(c)
               with lock: got[0] += len(c); prog[0] = time.time()
               el = time.time() - t0
-              if el > SLOW_S and (pos - o) / el < SLOW_BPS and end + 1 - pos > SUB:
-                with lock: q.extend(split(pos, end, SUB)); done_b[0] += pos - o; nsplit[0] += 1
-                log('SLOW', k, f'range {o >> 20}MB {(pos - o) / el / 1e6:.1f}MB/s -> {len(split(pos, end, SUB))} sub-ranges')
-                ok = None; break
-            if ok is not None and pos == end + 1:
-              with lock: done_b[0] += end + 1 - o
-              ok = True
+              if el > SLOW_S and (pos - o) / el < SLOW_BPS and pos <= end:
+                with lock:
+                  cov.append((o, pos - 1)) if pos > o else None
+                  q[:0] = split(pos, end, SUB); st['slow'] += 1
+                log('SLOW', k, f'range {o >> 20}MB {(pos - o) / el / 1e6:.1f}MB/s -> repede {end + 1 - pos >> 20}MB')
+                break
+            else:
+              if pos == end + 1:
+                with lock:
+                  if r not in feitos:
+                    feitos.add(r); cov.append(r)
+                    if r[0] >= cut and r in tail: st['hedge_win'] += 0
           except Exception as e:
             log('WARN range', k, o, type(e).__name__, str(e)[:120])
-          finally:
             with lock:
-              ativos[0] -= 1
-              if ok is False: todo.append((pos, end)); done_b[0] += pos - o
+              if pos > o: cov.append((o, pos - 1))
+          finally:
+            with lock: ativos[0] -= 1
       finally: os.close(fd)
     ths = [threading.Thread(target=worker, daemon=True) for _ in range(NCONN)]
     for t in ths: t.start()
     while any(t.is_alive() for t in ths):
-      time.sleep(2)
-      if time.time() - last[0] > 20: last[0] = time.time(); log('dl', k, got[0] >> 20, 'MB', f'{done_b[0] * 100 // size}%')
+      time.sleep(1)
+      if not gaps(cov, size): cancel.set(); break
+      if time.time() - last[0] > 20: last[0] = time.time(); log('dl', k, got[0] >> 20, 'MB', f'{sum(e - o + 1 for o, e in cov) * 100 // size}%')
       if time.time() - prog[0] > STALL_S:
-        log(f'STALL {STALL_S}s', k, f'{done_b[0] >> 20}MB'); cancel.set(); break
+        log(f'STALL {STALL_S}s', k); cancel.set(); break
     for t in ths: t.join(90)
-    with lock: todo += q; q.clear()
-  if todo or done_b[0] != size: raise RuntimeError(f'download incompleto apos {RESUMES} retomadas: {done_b[0]}/{size}')
-  if nsplit[0]: log('SPLITS', k, nsplit[0])
+    if not gaps(cov, size): break
+  t_tail[1] = time.time()
+  if gaps(cov, size): raise RuntimeError(f'download incompleto apos {RESUMES} retomadas: lacunas={len(gaps(cov, size))}')
+  log('TAIL', k, f'{(t_tail[1] - (t_tail[0] or t_tail[1])):.1f}s desde 1a parte da cauda', f'slow_repedidos={st["slow"]}')
 
 
 def from_hf(k, dst):
   if not HF_REPO: raise RuntimeError('HF_REPO nao definido')
+  os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER', '1')
   from huggingface_hub import hf_hub_download
+  mp = json.loads(E.get('HF_FILE_MAP', '{}'))  # {arquivo: 'repo:caminho'} opcional
   stop = threading.Event()
   def prog():
     while not stop.wait(20): log('dl', k, disk_bytes() >> 20, 'MB (models/ total)')
   threading.Thread(target=prog, daemon=True).start()
-  try: hf_hub_download(HF_REPO, k, local_dir=M)
+  repo, path = (mp[k].split(':', 1) if k in mp else (HF_REPO, k))
+  try:
+    f = hf_hub_download(repo, path, local_dir=M)
+    if os.path.abspath(f) != os.path.abspath(dst): os.replace(f, dst)
   finally: stop.set()
   if not os.path.exists(dst): raise FileNotFoundError(dst)
 

@@ -33,7 +33,7 @@ RUN if python -m pip install "$SAGE_SPEC" -c /opt/torch-constraints.txt >&2; the
       echo "sageattention=$(python -c 'import importlib.metadata as m;print(m.version("sageattention"))')"; \
     else echo "sageattention=none"; fi >> /opt/BUILD_INFO
 
-RUN python -m pip install boto3 "huggingface_hub[cli]" requests -c /opt/torch-constraints.txt && \
+RUN python -m pip install boto3 "huggingface_hub[cli]" hf_transfer requests -c /opt/torch-constraints.txt && \
     { python -m pip cache purge >/dev/null 2>&1 || true; } && rm -rf /root/.cache /tmp/* /var/lib/apt/lists/* && \
     cat /opt/BUILD_INFO
 

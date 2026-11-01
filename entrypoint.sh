@@ -15,7 +15,7 @@ up_log(){ up $L "${Q}pod.log"; }
 destroy(){ run python $N/selfdestroy.py; up_log; }
 
 for v in R2_EP R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET QUEUE_PREFIX MODELS_PREFIX; do
-  [ -n "${!v:-}" ] || { lg "ABORT env $v ausente"; python $N/selfdestroy.py; exit 2; }
+  [ -n "${!v:-}" ] || { lg "ABORT env $v ausente"; [ -n "${QUEUE_PREFIX:-}" ] && Q=${QUEUE_PREFIX%/}/ && up_log; python $N/selfdestroy.py; exit 2; }
 done
 Q=${QUEUE_PREFIX%/}/
 
@@ -31,7 +31,7 @@ fin(){
 trap fin EXIT
 trap 'rc=$?; lg "ABORT err linha $LINENO rc=$rc"; exit $rc' ERR
 
-(while sleep 30; do up_log; done) & HB=$!
+(while :; do up_log; sleep 10; done) & HB=$!  # log ao R2 desde o 1o segundo
 HARD=${HARD_TIMEOUT_S:-3600}
 (sleep "$HARD"; lg "ABORT hard_timeout ${HARD}s"; up_log; destroy) & WD=$!
 
