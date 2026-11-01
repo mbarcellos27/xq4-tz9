@@ -1,4 +1,5 @@
 # Baixa os arquivos do manifest (MODELS_PREFIX) para models/, com reserva opcional HF_REPO.
+# R2: ranged GET paralelo com ate DL_RESUMES (2) retomadas por arquivo apos STALL_S parado.
 # Saida: 0 ok, 3 stall (bytes parados por STALL_S), 4 falha de verificacao/download.
 import hashlib, json, os, sys, threading, time
 import boto3
@@ -54,12 +55,54 @@ def check_hash(path, want, k):
   if not ok: hash_fail.append(k)
 
 
+PART = 64 << 20
+RESUMES = int(E.get('DL_RESUMES', '2'))
+from botocore.config import Config as BCfg
+s3dl = boto3.client('s3', endpoint_url=E['R2_EP'], aws_access_key_id=E['R2_ACCESS_KEY_ID'],
+                    aws_secret_access_key=E['R2_SECRET_ACCESS_KEY'], region_name='auto',
+                    config=BCfg(read_timeout=60, connect_timeout=20, retries={'max_attempts': 3}, max_pool_connections=40))
+
+
 def from_r2(k, dst):
+  # ranged GET em paralelo (partes de 64 MB) com retomada: parado STALL_S => cancela e retoma so as partes faltantes
+  size = s3dl.head_object(Bucket=B, Key=P + k)['ContentLength']
+  with open(dst, 'ab') as f: f.truncate(size)
+  parts = list(range(0, size, PART)); done = set(); lock = threading.Lock()
   got, last = [0], [time.time()]
-  def cb(n):
-    got[0] += n
-    if time.time() - last[0] > 20: last[0] = time.time(); log('dl', k, got[0] >> 20, 'MB')
-  s3.download_file(B, P + k, dst, Config=cfg, Callback=cb)
+  for tent in range(RESUMES + 1):
+    falta = [o for o in parts if o not in done]
+    if not falta: break
+    if tent: log('RESUME', k, f'tentativa={tent}', f'partes_faltando={len(falta)}', f'{got[0] >> 20}MB')
+    cancel = threading.Event(); prog = [time.time()]; q = list(falta)
+    def worker():
+      fd = os.open(dst, os.O_WRONLY)
+      try:
+        while not cancel.is_set():
+          with lock:
+            if not q: return
+            o = q.pop(0)
+          end = min(o + PART, size) - 1; pos = o
+          try:
+            body = s3dl.get_object(Bucket=B, Key=P + k, Range=f'bytes={o}-{end}')['Body']
+            for c in body.iter_chunks(1 << 20):
+              if cancel.is_set(): return
+              os.pwrite(fd, c, pos); pos += len(c)
+              with lock: got[0] += len(c); prog[0] = time.time()
+            if pos == end + 1:
+              with lock: done.add(o)
+          except Exception as e:
+            log('WARN parte', k, o, type(e).__name__, str(e)[:120])
+      finally: os.close(fd)
+    ths = [threading.Thread(target=worker, daemon=True) for _ in range(16)]
+    for t in ths: t.start()
+    while any(t.is_alive() for t in ths):
+      time.sleep(5)
+      if len(done) == len(parts): break
+      if time.time() - last[0] > 20: last[0] = time.time(); log('dl', k, got[0] >> 20, 'MB', f'partes {len(done)}/{len(parts)}')
+      if time.time() - prog[0] > STALL_S:
+        log(f'STALL {STALL_S}s', k, f'partes {len(done)}/{len(parts)}'); cancel.set(); break
+    for t in ths: t.join(90)
+  if len(done) != len(parts): raise RuntimeError(f'download incompleto apos {RESUMES} retomadas: partes {len(done)}/{len(parts)}')
 
 
 def from_hf(k, dst):
@@ -87,7 +130,8 @@ def main():
     else:
       origin = None
       for name, fn in (('R2', from_r2), ('HF', from_hf)):
-        t = time.time(); downloading.set()
+        t = time.time()
+        if name == 'HF': downloading.set()
         try:
           fn(k, dst)
           if os.path.getsize(dst) != v['size']: raise ValueError(f'size {os.path.getsize(dst)} != {v["size"]}')
