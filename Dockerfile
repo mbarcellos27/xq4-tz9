@@ -37,7 +37,7 @@ RUN python -m pip install boto3 "huggingface_hub[cli]" hf_transfer requests -c /
     { python -m pip cache purge >/dev/null 2>&1 || true; } && rm -rf /root/.cache /tmp/* /var/lib/apt/lists/* && \
     cat /opt/BUILD_INFO
 
-COPY --chmod=755 entrypoint.sh fetch_models.py worker.py selfdestroy.py smoke.py /opt/w/
+COPY --chmod=755 entrypoint.sh fetch_models.py worker.py selfdestroy.py smoke.py post_bench.py /opt/w/
 WORKDIR /opt/app
 ENTRYPOINT ["/opt/w/entrypoint.sh"]
 CMD []

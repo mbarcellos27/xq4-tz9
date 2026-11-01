@@ -73,6 +73,7 @@ done
 lg "PHASE srv_up $FLAGS"
 
 run python $N/worker.py || { rc=$?; lg "ABORT worker rc=$rc"; exit $rc; }
+lg "PHASE postbench"; run python $N/post_bench.py || lg "WARN postbench rc=$?"
 lg "PHASE done"
 date -u +%FT%TZ > /DONE; up /DONE "${Q}DONE" || lg "WARN upload DONE falhou"
 exit 0
